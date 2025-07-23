@@ -1,104 +1,134 @@
-const puppeteer = require('puppeteer');
-//const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const axios = require('axios');
+const fs = require('fs');
+const { OpenAI } = require('openai');
 require('dotenv').config();
 
-//puppeteer.use(StealthPlugin());
+puppeteer.use(StealthPlugin());
+const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
 
-async function scrapeInstagram(handle) {
+async function scrapeInstagram(handle, taskDescription) {
   const browser = await puppeteer.launch({ headless: false });
   const page = await browser.newPage();
+  page.setDefaultNavigationTimeout(60000);
 
-  // 1️⃣ Go to login page
+  console.log(`[🔐] Logging into Instagram...`);
   await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'networkidle2' });
-
-  // 2️⃣ Enter credentials
   await page.type('input[name="username"]', process.env.INSTAGRAM_USER, { delay: 50 });
   await page.type('input[name="password"]', process.env.INSTAGRAM_PASS, { delay: 50 });
-
   await page.click('button[type="submit"]');
-
-  // 3️⃣ Wait for home page to load
   await page.waitForNavigation({ waitUntil: 'networkidle2' });
 
-// Close first "Not Now"
-try {
-  await page.waitForXPath('//button[text()="Not Now"]', { timeout: 5000 });
-  const [button1] = await page.$x('//button[text()="Not Now"]');
-  if (button1) await button1.click();
-  console.log('Closed Save Login Info pop-up.');
-} catch (err) {
-  console.log('No Save Login Info pop-up.');
-}
+  try {
+    const [btn1] = await page.$x('//button[text()="Not Now"]');
+    if (btn1) await btn1.click();
+  } catch {}
+  try {
+    const [btn2] = await page.$x('//button[text()="Not Now"]');
+    if (btn2) await btn2.click();
+  } catch {}
 
-// Close second "Not Now" if shown
-try {
-  await page.waitForXPath('//button[text()="Not Now"]', { timeout: 5000 });
-  const [button2] = await page.$x('//button[text()="Not Now"]');
-  if (button2) await button2.click();
-  console.log('Closed Notifications pop-up.');
-} catch (err) {
-  console.log('No Notifications pop-up.');
-}
-
-
-
-  // 4️⃣ Go to target profile
+  console.log(`[📸] Visiting profile: ${handle}`);
   await page.goto(`https://www.instagram.com/${handle}/`, { waitUntil: 'networkidle2' });
+  await page.screenshot({ path: 'profile_page.png', fullPage: true });
+  const html = await page.content();
+  fs.writeFileSync('raw_profile.html', html);
 
-  // 5️⃣ Wait for posts
-await smartScroll(page);
-// await page.waitForSelector('a[href^="/p/"]', { timeout: 10000 });
+  await smartScroll(page, 50);
+  console.log(`[✅] Finished scrolling.`);
 
-// Test: log all links
-// const allLinks = await page.evaluate(() =>
-//   Array.from(document.querySelectorAll('a')).map(a => a.href)
-// );
-// console.log('All found links:', allLinks);
+const posts = await page.evaluate(() => {
+  const imgElements = Array.from(document.querySelectorAll('img'));
+  const data = [];
+  const seen = new Set();
 
-const allLinks = await page.evaluate(() =>
-  Array.from(document.querySelectorAll('a')).map(a => a.href)
-);
+  for (const img of imgElements) {
+    const caption = img.alt || '';
+    const imgUrl = img.src;
 
-const posts = allLinks.filter(
-  href => href.includes('/p/') || href.includes('/reel/')
-).map(href => ({ postUrl: href }));
+    // Traverse up to find enclosing post link
+    let el = img.parentElement;
+    while (el && el.tagName !== 'A') {
+      el = el.parentElement;
+    }
 
-console.log('Scraped posts:', posts);
+    const postUrl = el?.href;
+    if (postUrl && postUrl.includes('/p/') && !seen.has(postUrl)) {
+      seen.add(postUrl);
+      data.push({ href: postUrl, img: imgUrl, caption });
+    }
+  }
 
+  return data;
+});
+
+
+
+  console.log(`[📦] Found ${posts.length} post candidates.`);
+  const results = [];
+
+  for (const post of posts.slice(0, 10)) {
+    if (!post.img) continue;
+
+    console.log(`[🔍] Analyzing post:\nImage: ${post.img}\nCaption: ${post.caption}`);
+    const match = await analyzeImageWithTask(post.img, taskDescription);
+    results.push({ ...post, match });
+  }
 
   await browser.close();
-  return posts.slice(0, 10);
+  console.log('[🎯] Final Results:', results);
+  return results;
 }
 
-async function smartScroll(page, minPosts = 30) {
-  let previousHeight = 0;
-  let postsCount = 0;
+async function smartScroll(page, minPosts = 50) {
+  let prevHeight = 0;
+  let postCount = 0;
   let tries = 0;
 
-  while (postsCount < minPosts && tries < 10) {
-    postsCount = await page.evaluate(() =>
+  while (postCount < minPosts && tries < 12) {
+    postCount = await page.evaluate(() =>
       document.querySelectorAll('a[href^="/p/"], a[href^="/reel/"]').length
     );
-
-    previousHeight = await page.evaluate('document.body.scrollHeight');
+    prevHeight = await page.evaluate('document.body.scrollHeight');
     await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
-    await new Promise(r => setTimeout(r, 1500)); 
+    await new Promise(r => setTimeout(r, 2000));
     const newHeight = await page.evaluate('document.body.scrollHeight');
-
-    if (newHeight === previousHeight) {
-      break; // no more new posts loading
-    }
+    if (newHeight === prevHeight) break;
     tries++;
   }
 }
 
+async function analyzeImageWithTask(imageUrl, taskDescription) {
+  try {
+    const imgBuffer = (await axios.get(imageUrl, { responseType: 'arraybuffer' })).data;
+    const base64 = Buffer.from(imgBuffer).toString('base64');
 
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4-vision-preview',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: `Does this image match the task: "${taskDescription}"?  Be flexible and consider artistic or educational representations too. Reply with "Yes" or "No" and explain briefly.Reply yes/no and explain.` },
+            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } },
+          ],
+        },
+      ],
+    });
 
+    return response.choices[0].message.content;
+  } catch (err) {
+    console.error('[❌] Error analyzing image:', err.message);
+    return 'Analysis failed';
+  }
+}
 
 module.exports = { scrapeInstagram };
 
-
-
-
-
-
+// // 🔁 Optional local test run
+// if (require.main === module) {
+//   const handle = 'natgeo'; // test with public, media-heavy profiles
+//   const taskDescription = 'person using a telescope outdoors';
+//   scrapeInstagram(handle, taskDescription).then(console.log);
+// }
